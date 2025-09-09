@@ -179,14 +179,15 @@ def join_datasets():
 
 def export_data():
     """
-    Exporta a EXCEL (.xlsx) con columnas verdaderas,
-    una película por fila.
+    Exporta a EXCEL (.xlsx) si hay engine disponible (openpyxl/xlsxwriter).
+    Si no, genera CSV con separador ';' para que Excel lo abra en columnas.
+    Nunca revienta: siempre deja algún archivo en OUTPUT_PATH.
     """
     _ensure_dirs()
     src = os.path.join(STAGING_PATH, "movies_with_ratings.csv")
     df = pd.read_csv(src)
 
-    # Renombrar/ordenar columnas para Excel
+    # Renombrar/ordenar columnas (una película por fila, cada dato en su columna)
     ordered_cols = [
         "movieId", "title_clean", "year",
         "genero_1","genero_2","genero_3","genero_4","genero_5","genero_6",
@@ -204,17 +205,49 @@ def export_data():
         "popularity_score": "popularidad_bayes",
     })
 
-    # Redondeos
     if "promedio_rating" in df.columns:
         df["promedio_rating"] = df["promedio_rating"].astype(float).round(3)
     if "popularidad_bayes" in df.columns:
         df["popularidad_bayes"] = df["popularidad_bayes"].astype(float).round(3)
 
-    # Orden consistente
     df = df.sort_values(["titulo","anio","movie_id"]).reset_index(drop=True)
 
-    excel_path = os.path.join(OUTPUT_PATH, EXCEL_FILENAME)
-    _write_excel_table(df, excel_path, EXCEL_SHEET)
+    excel_path = os.path.join(OUTPUT_PATH, "movies_with_ratings.xlsx")
+    csv_fallback = os.path.join(OUTPUT_PATH, "movies_with_ratings.csv")
+
+    # Intentar EXCEL con openpyxl, luego con xlsxwriter. Si no, CSV con ';'
+    wrote_excel = False
+    for engine in ("openpyxl", "xlsxwriter"):
+        try:
+            with pd.ExcelWriter(excel_path, engine=engine) as writer:
+                df.to_excel(writer, sheet_name="Películas", index=False)
+
+                # Ajuste de ancho de columnas (best-effort)
+                try:
+                    if engine == "xlsxwriter":
+                        worksheet = writer.sheets["Películas"]
+                        for i, col in enumerate(df.columns):
+                            max_len = max([len(str(col))] + [len(str(v)) for v in df[col].astype(str).values])
+                            worksheet.set_column(i, i, min(max(10, max_len + 2), 60))
+                    elif engine == "openpyxl":
+                        from openpyxl.utils import get_column_letter
+                        ws = writer.book["Películas"]
+                        for i, col in enumerate(df.columns, start=1):
+                            max_len = max([len(str(col))] + [len(str(v)) for v in df[col].astype(str).values])
+                            ws.column_dimensions[get_column_letter(i)].width = min(max(10, max_len + 2), 60)
+                except Exception:
+                    # Si el auto-width falla, igual dejamos el Excel generado.
+                    pass
+
+            wrote_excel = True
+            break
+        except Exception:
+            continue
+
+    if not wrote_excel:
+        # Fallback sin romper el DAG: CSV con ';' para que Excel lo abra en columnas
+        df.to_csv(csv_fallback, index=False, sep=';')
+
 
 # ===================== DAG =====================
 with DAG(
