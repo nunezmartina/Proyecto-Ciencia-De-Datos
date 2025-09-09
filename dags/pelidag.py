@@ -15,8 +15,9 @@ STAGING_PATH = f"{DATA_DIR}/staging"
 OUTPUT_PATH = "/usr/local/airflow/include/output"
 MOVIELENS_URL = "http://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
 
-EXCEL_FILENAME = "movies_with_ratings.xlsx"
-EXCEL_SHEET = "Películas"
+EXCEL_SHEET_CLEAN = "Películas (clean)"
+EXCEL_SHEET_FINAL = "Películas"
+EXCEL_FILENAME_FINAL = "movies_with_ratings.xlsx"
 MAX_GENRE_COLS = 6  # columnas genero_1..genero_6
 
 default_args = {
@@ -41,12 +42,12 @@ def _split_genres_to_cols(genres: str, max_cols: int) -> List[str]:
     uniq = [p for p in parts if not (p in seen or seen.add(p))]
     return (uniq + [""] * max_cols)[:max_cols]
 
-def _write_excel_table(df: pd.DataFrame, path: str, sheet_name: str):
+def _write_excel_table_openpyxl(df: pd.DataFrame, path: str, sheet_name: str):
     """
-    Crea un .xlsx con:
+    Escribe un .xlsx bonito con openpyxl:
     - Tabla con filtros
     - Encabezado congelado
-    - Ancho de columnas ajustado
+    - Anchos de columna
     """
     from openpyxl import Workbook
     from openpyxl.utils.dataframe import dataframe_to_rows
@@ -68,22 +69,48 @@ def _write_excel_table(df: pd.DataFrame, path: str, sheet_name: str):
     last_col = ws.max_column
     ref = f"A1:{get_column_letter(last_col)}{last_row}"
 
-    tab = Table(displayName="Peliculas", ref=ref)
+    tab = Table(displayName="TablaPeliculas", ref=ref)
     tab.tableStyleInfo = TableStyleInfo(
         name="TableStyleMedium9", showRowStripes=True, showColumnStripes=False
     )
     ws.add_table(tab)
 
-    # congelar encabezado
     ws.freeze_panes = "A2"
 
-    # ancho columnas
     for col_idx in range(1, last_col + 1):
         col_letter = get_column_letter(col_idx)
         max_len = max((len(str(c.value)) if c.value is not None else 0) for c in ws[col_letter])
         ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 60)
 
     wb.save(path)
+
+def _safe_write_excel(df: pd.DataFrame, path: str, sheet_name: str):
+    """
+    Intenta openpyxl con formato de tabla; si falla, usa xlsxwriter; si no hay engine, CSV fallback.
+    """
+    # 1) openpyxl con formato lindo
+    try:
+        _write_excel_table_openpyxl(df, path, sheet_name)
+        return {"format": "xlsx-openpyxl", "path": path}
+    except Exception:
+        pass
+
+    # 2) pandas + xlsxwriter con auto-anchos
+    try:
+        with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+            worksheet = writer.sheets[sheet_name]
+            for i, col in enumerate(df.columns):
+                max_len = max([len(str(col))] + [len(str(v)) for v in df[col].astype(str).values])
+                worksheet.set_column(i, i, min(max(10, max_len + 2), 60))
+        return {"format": "xlsx-xlsxwriter", "path": path}
+    except Exception:
+        pass
+
+    # 3) fallback CSV con ';' (Excel AR/ES lo abre en columnas)
+    csv_path = os.path.splitext(path)[0] + ".csv"
+    df.to_csv(csv_path, index=False, sep=";")
+    return {"format": "csv-fallback", "path": csv_path}
 
 # ===================== Tareas =====================
 def extract_data():
@@ -113,7 +140,7 @@ def transform_data():
                    .str.strip()
     )
 
-    # Normalizar géneros (sin duplicados, sin '(no genres listed)')
+    # Normalizar géneros
     def clean_genres(g):
         if pd.isna(g): return ""
         s = str(g).strip()
@@ -125,14 +152,14 @@ def transform_data():
 
     df["genres"] = df["genres"].map(clean_genres)
 
-    # Expandir a columnas genero_1..genero_n
+    # Expandir géneros a columnas genero_1..genero_n
     genre_cols = [f"genero_{i}" for i in range(1, MAX_GENRE_COLS + 1)]
     genre_df = pd.DataFrame(
         df["genres"].apply(lambda s: _split_genres_to_cols(s, MAX_GENRE_COLS)).tolist(),
         columns=genre_cols
     )
 
-    # Selección + orden (sin listas en celdas)
+    # Ensamble limpio (sin listas en celdas)
     df_clean = (
         pd.concat([df[["movieId", "title_clean", "year", "genres"]], genre_df], axis=1)
           .sort_values(["title_clean","year","movieId"])
@@ -152,7 +179,7 @@ def transform_ratings():
         mean_rating=("rating", "mean")
     ).reset_index()
 
-    # Popularidad bayesiana
+    # Popularidad bayesiana (suavizado)
     global_mean = df["rating"].mean()
     m = 50
     stats["popularity_score"] = (
@@ -177,6 +204,34 @@ def join_datasets():
 
     merged.to_csv(os.path.join(STAGING_PATH, "movies_with_ratings.csv"), index=False)
 
+def export_movies_clean():
+    """
+    Genera OUTPUT_PATH/movies_clean.xlsx con una fila por película y columnas reales.
+    Si no hay engine de Excel, deja CSV con ';' (no rompe el DAG).
+    """
+    _ensure_dirs()
+    src = os.path.join(STAGING_PATH, "movies_clean.csv")
+    if not os.path.exists(src):
+        raise FileNotFoundError("No existe movies_clean.csv. Corré transform_data primero.")
+
+    df = pd.read_csv(src)
+
+    ordered_cols = [
+        "movieId", "title_clean", "year",
+        "genero_1","genero_2","genero_3","genero_4","genero_5","genero_6",
+        "genres"
+    ]
+    ordered_cols = [c for c in ordered_cols if c in df.columns]
+    df = df[ordered_cols].rename(columns={
+        "movieId": "movie_id",
+        "title_clean": "titulo",
+        "year": "anio",
+        "genres": "generos_todos",
+    }).sort_values(["titulo","anio","movie_id"]).reset_index(drop=True)
+
+    out_path = os.path.join(OUTPUT_PATH, "movies_clean.xlsx")
+    _ = _safe_write_excel(df, out_path, EXCEL_SHEET_CLEAN)
+
 def export_data():
     """
     Exporta a EXCEL (.xlsx) si hay engine disponible (openpyxl/xlsxwriter).
@@ -187,7 +242,7 @@ def export_data():
     src = os.path.join(STAGING_PATH, "movies_with_ratings.csv")
     df = pd.read_csv(src)
 
-    # Renombrar/ordenar columnas (una película por fila, cada dato en su columna)
+    # Renombrar/ordenar columnas
     ordered_cols = [
         "movieId", "title_clean", "year",
         "genero_1","genero_2","genero_3","genero_4","genero_5","genero_6",
@@ -212,49 +267,15 @@ def export_data():
 
     df = df.sort_values(["titulo","anio","movie_id"]).reset_index(drop=True)
 
-    excel_path = os.path.join(OUTPUT_PATH, "movies_with_ratings.xlsx")
-    csv_fallback = os.path.join(OUTPUT_PATH, "movies_with_ratings.csv")
-
-    # Intentar EXCEL con openpyxl, luego con xlsxwriter. Si no, CSV con ';'
-    wrote_excel = False
-    for engine in ("openpyxl", "xlsxwriter"):
-        try:
-            with pd.ExcelWriter(excel_path, engine=engine) as writer:
-                df.to_excel(writer, sheet_name="Películas", index=False)
-
-                # Ajuste de ancho de columnas (best-effort)
-                try:
-                    if engine == "xlsxwriter":
-                        worksheet = writer.sheets["Películas"]
-                        for i, col in enumerate(df.columns):
-                            max_len = max([len(str(col))] + [len(str(v)) for v in df[col].astype(str).values])
-                            worksheet.set_column(i, i, min(max(10, max_len + 2), 60))
-                    elif engine == "openpyxl":
-                        from openpyxl.utils import get_column_letter
-                        ws = writer.book["Películas"]
-                        for i, col in enumerate(df.columns, start=1):
-                            max_len = max([len(str(col))] + [len(str(v)) for v in df[col].astype(str).values])
-                            ws.column_dimensions[get_column_letter(i)].width = min(max(10, max_len + 2), 60)
-                except Exception:
-                    # Si el auto-width falla, igual dejamos el Excel generado.
-                    pass
-
-            wrote_excel = True
-            break
-        except Exception:
-            continue
-
-    if not wrote_excel:
-        # Fallback sin romper el DAG: CSV con ';' para que Excel lo abra en columnas
-        df.to_csv(csv_fallback, index=False, sep=';')
-
+    excel_path = os.path.join(OUTPUT_PATH, EXCEL_FILENAME_FINAL)
+    _ = _safe_write_excel(df, excel_path, EXCEL_SHEET_FINAL)
 
 # ===================== DAG =====================
 with DAG(
     dag_id="movies_pipeline_excel_ok",
     default_args=default_args,
-    description="Películas + ratings a Excel (una fila por película, columnas limpias)",
-    schedule=None,  # en Airflow <2.8 usar 'schedule_interval=None'
+    description="Películas limpias y con ratings a Excel (una fila por película, columnas limpias)",
+    schedule=None,  # en Airflow<2.8 usar 'schedule_interval=None'
     catchup=False,
     tags=["movies","excel","etl"],
 ) as dag:
@@ -264,9 +285,14 @@ with DAG(
     t3 = PythonOperator(task_id="transform_data", python_callable=transform_data)
     t4 = PythonOperator(task_id="transform_ratings", python_callable=transform_ratings)
     t5 = PythonOperator(task_id="join_datasets", python_callable=join_datasets)
-    t6 = PythonOperator(task_id="export_data", python_callable=export_data)
 
+    # Exports
+    t6_clean = PythonOperator(task_id="export_movies_clean", python_callable=export_movies_clean)
+    t6_final = PythonOperator(task_id="export_data", python_callable=export_data)
+
+    # Dependencias
     t1 >> t2
     t2 >> t3
     t1 >> t4
-    [t3, t4] >> t5 >> t6
+    t3 >> t6_clean
+    [t3, t4] >> t5 >> t6_final
