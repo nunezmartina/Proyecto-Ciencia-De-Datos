@@ -3,9 +3,10 @@ from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 import pandas as pd
 import os
-import requests
-import zipfile
 import io
+import zipfile
+import requests
+from typing import List
 
 # ===================== Configuración =====================
 DATA_DIR = "/tmp/movies"
@@ -13,6 +14,10 @@ RAW_PATH = f"{DATA_DIR}/raw"
 STAGING_PATH = f"{DATA_DIR}/staging"
 OUTPUT_PATH = "/usr/local/airflow/include/output"
 MOVIELENS_URL = "http://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
+
+EXCEL_FILENAME = "movies_with_ratings.xlsx"
+EXCEL_SHEET = "Películas"
+MAX_GENRE_COLS = 6  # columnas genero_1..genero_6
 
 default_args = {
     "owner": "grupo",
@@ -22,27 +27,85 @@ default_args = {
     "depends_on_past": False,
 }
 
-# ===================== Funciones =====================
-def extract_data():
+# ===================== Utilidades =====================
+def _ensure_dirs():
     os.makedirs(RAW_PATH, exist_ok=True)
+    os.makedirs(STAGING_PATH, exist_ok=True)
+    os.makedirs(OUTPUT_PATH, exist_ok=True)
+
+def _split_genres_to_cols(genres: str, max_cols: int) -> List[str]:
+    if not isinstance(genres, str) or not genres.strip():
+        return [""] * max_cols
+    parts = [p.strip() for p in genres.split("|") if p.strip()]
+    seen = set()
+    uniq = [p for p in parts if not (p in seen or seen.add(p))]
+    return (uniq + [""] * max_cols)[:max_cols]
+
+def _write_excel_table(df: pd.DataFrame, path: str, sheet_name: str):
+    """
+    Crea un .xlsx con:
+    - Tabla con filtros
+    - Encabezado congelado
+    - Ancho de columnas ajustado
+    """
+    from openpyxl import Workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+    from openpyxl.utils import get_column_letter
+
+    if os.path.exists(path):
+        os.remove(path)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name
+
+    # volcar DataFrame
+    for row in dataframe_to_rows(df, index=False, header=True):
+        ws.append(row)
+
+    last_row = ws.max_row
+    last_col = ws.max_column
+    ref = f"A1:{get_column_letter(last_col)}{last_row}"
+
+    tab = Table(displayName="Peliculas", ref=ref)
+    tab.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium9", showRowStripes=True, showColumnStripes=False
+    )
+    ws.add_table(tab)
+
+    # congelar encabezado
+    ws.freeze_panes = "A2"
+
+    # ancho columnas
+    for col_idx in range(1, last_col + 1):
+        col_letter = get_column_letter(col_idx)
+        max_len = max((len(str(c.value)) if c.value is not None else 0) for c in ws[col_letter])
+        ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 60)
+
+    wb.save(path)
+
+# ===================== Tareas =====================
+def extract_data():
+    _ensure_dirs()
     resp = requests.get(MOVIELENS_URL, timeout=60)
-    if resp.status_code == 200:
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-            z.extractall(RAW_PATH)
-    else:
+    if resp.status_code != 200:
         raise Exception(f"Error al descargar datos: {resp.status_code}")
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+        z.extractall(RAW_PATH)
 
 def load_raw():
-    os.makedirs(STAGING_PATH, exist_ok=True)
-    source_file = os.path.join(RAW_PATH, "ml-latest-small", "movies.csv")
-    dest_file = os.path.join(STAGING_PATH, "movies_raw.csv")
-    pd.read_csv(source_file).to_csv(dest_file, index=False)
+    _ensure_dirs()
+    src = os.path.join(RAW_PATH, "ml-latest-small", "movies.csv")
+    dst = os.path.join(STAGING_PATH, "movies_raw.csv")
+    pd.read_csv(src).to_csv(dst, index=False)
 
 def transform_data():
+    _ensure_dirs()
     staging_file = os.path.join(STAGING_PATH, "movies_raw.csv")
     df = pd.read_csv(staging_file)
 
-    # Año y título
+    # Año y título limpio
     df["year"] = pd.to_numeric(df["title"].str.extract(r"\((\d{4})\)")[0], errors="coerce").astype("Int64")
     df["title_clean"] = (
         df["title"].str.replace(r"\(\d{4}\)", "", regex=True)
@@ -50,32 +113,40 @@ def transform_data():
                    .str.strip()
     )
 
-    # Géneros
+    # Normalizar géneros (sin duplicados, sin '(no genres listed)')
     def clean_genres(g):
         if pd.isna(g): return ""
-        g = str(g).strip()
-        if g.lower() == "(no genres listed)": return ""
-        parts = [p.strip() for p in g.split("|") if p.strip()]
-        seen = set(); uniq = [p for p in parts if not (p in seen or seen.add(p))]
+        s = str(g).strip()
+        if s.lower() == "(no genres listed)": return ""
+        parts = [p.strip() for p in s.split("|") if p.strip()]
+        seen = set()
+        uniq = [p for p in parts if not (p in seen or seen.add(p))]
         return "|".join(uniq)
 
     df["genres"] = df["genres"].map(clean_genres)
-    df["genres_list"] = df["genres"].apply(lambda s: [p for p in s.split("|") if p] if s else [])
 
-    # Selección + orden
-    df_clean = (df[["movieId","title_clean","year","genres","genres_list"]]
-                .sort_values(["title_clean","year","movieId"])
-                .drop_duplicates(subset=["movieId"])
-                .reset_index(drop=True))
+    # Expandir a columnas genero_1..genero_n
+    genre_cols = [f"genero_{i}" for i in range(1, MAX_GENRE_COLS + 1)]
+    genre_df = pd.DataFrame(
+        df["genres"].apply(lambda s: _split_genres_to_cols(s, MAX_GENRE_COLS)).tolist(),
+        columns=genre_cols
+    )
 
-    out_tmp = os.path.join(STAGING_PATH, "movies_clean.csv")
-    df_clean.to_csv(out_tmp, index=False)
+    # Selección + orden (sin listas en celdas)
+    df_clean = (
+        pd.concat([df[["movieId", "title_clean", "year", "genres"]], genre_df], axis=1)
+          .sort_values(["title_clean","year","movieId"])
+          .drop_duplicates(subset=["movieId"])
+          .reset_index(drop=True)
+    )
+
+    df_clean.to_csv(os.path.join(STAGING_PATH, "movies_clean.csv"), index=False)
 
 def transform_ratings():
-    source_file = os.path.join(RAW_PATH, "ml-latest-small", "ratings.csv")
-    df = pd.read_csv(source_file)
+    _ensure_dirs()
+    src = os.path.join(RAW_PATH, "ml-latest-small", "ratings.csv")
+    df = pd.read_csv(src)
 
-    # Estadísticas por película
     stats = df.groupby("movieId").agg(
         n_ratings=("rating", "count"),
         mean_rating=("rating", "mean")
@@ -83,16 +154,16 @@ def transform_ratings():
 
     # Popularidad bayesiana
     global_mean = df["rating"].mean()
-    m = 50  # parámetro de suavizado
+    m = 50
     stats["popularity_score"] = (
         (stats["n_ratings"] / (stats["n_ratings"] + m)) * stats["mean_rating"]
         + (m / (stats["n_ratings"] + m)) * global_mean
     )
 
-    out_tmp = os.path.join(STAGING_PATH, "ratings_stats.csv")
-    stats.to_csv(out_tmp, index=False)
+    stats.to_csv(os.path.join(STAGING_PATH, "ratings_stats.csv"), index=False)
 
 def join_datasets():
+    _ensure_dirs()
     movies_file = os.path.join(STAGING_PATH, "movies_clean.csv")
     ratings_file = os.path.join(STAGING_PATH, "ratings_stats.csv")
 
@@ -100,26 +171,59 @@ def join_datasets():
     ratings = pd.read_csv(ratings_file)
 
     merged = movies.merge(ratings, on="movieId", how="left")
-    merged[["n_ratings","mean_rating","popularity_score"]] = merged[
-        ["n_ratings","mean_rating","popularity_score"]
-    ].fillna(0)
+    for c in ["n_ratings","mean_rating","popularity_score"]:
+        if c in merged.columns:
+            merged[c] = merged[c].fillna(0)
 
-    out_file = os.path.join(STAGING_PATH, "movies_with_ratings.csv")
-    merged.to_csv(out_file, index=False)
+    merged.to_csv(os.path.join(STAGING_PATH, "movies_with_ratings.csv"), index=False)
 
 def export_data():
-    os.makedirs(OUTPUT_PATH, exist_ok=True)
-    source_file = os.path.join(STAGING_PATH, "movies_with_ratings.csv")
-    dest_file = os.path.join(OUTPUT_PATH, "movies_with_ratings.csv")
-    pd.read_csv(source_file).to_csv(dest_file, index=False)
+    """
+    Exporta a EXCEL (.xlsx) con columnas verdaderas,
+    una película por fila.
+    """
+    _ensure_dirs()
+    src = os.path.join(STAGING_PATH, "movies_with_ratings.csv")
+    df = pd.read_csv(src)
+
+    # Renombrar/ordenar columnas para Excel
+    ordered_cols = [
+        "movieId", "title_clean", "year",
+        "genero_1","genero_2","genero_3","genero_4","genero_5","genero_6",
+        "genres", "n_ratings", "mean_rating", "popularity_score"
+    ]
+    ordered_cols = [c for c in ordered_cols if c in df.columns]
+
+    df = df[ordered_cols].rename(columns={
+        "movieId": "movie_id",
+        "title_clean": "titulo",
+        "year": "anio",
+        "genres": "generos_todos",
+        "n_ratings": "cantidad_ratings",
+        "mean_rating": "promedio_rating",
+        "popularity_score": "popularidad_bayes",
+    })
+
+    # Redondeos
+    if "promedio_rating" in df.columns:
+        df["promedio_rating"] = df["promedio_rating"].astype(float).round(3)
+    if "popularidad_bayes" in df.columns:
+        df["popularidad_bayes"] = df["popularidad_bayes"].astype(float).round(3)
+
+    # Orden consistente
+    df = df.sort_values(["titulo","anio","movie_id"]).reset_index(drop=True)
+
+    excel_path = os.path.join(OUTPUT_PATH, EXCEL_FILENAME)
+    _write_excel_table(df, excel_path, EXCEL_SHEET)
 
 # ===================== DAG =====================
 with DAG(
-    dag_id="movies_pipeline_v2",
+    dag_id="movies_pipeline_excel_ok",
     default_args=default_args,
-    description="Pipeline de películas + ratings",
-    schedule=None,
+    description="Películas + ratings a Excel (una fila por película, columnas limpias)",
+    schedule=None,  # en Airflow <2.8 usar 'schedule_interval=None'
     catchup=False,
+    tags=["movies","excel","etl"],
 ) as dag:
 
     t1 = PythonOperator(task_id="extract_data", python_callable=extract_data)
