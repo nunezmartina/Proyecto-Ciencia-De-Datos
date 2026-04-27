@@ -939,7 +939,7 @@ elif page == "Introducción al proyecto":
                 <li><strong>Extracción y procesamiento de datos:</strong> Airflow automatizó la obtención de peliculas desde APIs externas. Se APIs: IMdb</li>
                 <li><strong>Análisis exploratorio:</strong> Realizamos un <em>EDA</em> en Google Colab formulando hipótesis sobre la relación entre las características de las peliculas y sus géneros.</li>
                 <li><strong>Aprendizaje supervisado:</strong> Entrenamos distintos modelos para predecir el género de una pelicula, siendo el <em>Random Forest</em> el de mejor desempeño, aunque con limitaciones debido a la cantidad de géneros disponibles.</li>
-                <li><strong>Aprendizaje no supervisado:</strong> Aplicamos <em>PCA</em> para reducir dimensiones y descubrimos que lo mejor era utilizar dos componentes. A partir de ellas, se identificaron dos <em>clusters</em>.</li>
+                <li><strong>Aprendizaje no supervisado:</strong> Aplicamos <em>PCA</em> para reducir dimensiones y descubrimos que lo mejor era utilizar dos componentes. A partir de ellas, se identificaron tres <em>clusters</em>.</li>
                 <li><strong>Detección de anomalías:</strong> Usamos el algoritmo <em>Isolation Forest</em> para encontrar alrededor de 300 peliculas con combinaciones inusuales de características.</li>
                 <li><strong>Visualización interactiva:</strong> Finalmente, desarrollamos esta aplicación en <em>Streamlit</em> para permitir al usuario explorar peliculas, conocer sus características y descubrir temas similares.</li>
             </ol>
