@@ -223,7 +223,7 @@ if page == "Explorador de peliculas":
 
         <div style="position: relative; width: 30%; height: 200px; border-radius: 15px; overflow: hidden; background-color: {'#e57373' if selected_song['anomaly'] == -1 else '#8B4513'}; box-shadow: 0px 2px 10px rgba(0,0,0,0.4); color: white; text-align: center; font-weight: bold; text-shadow: 1px 1px 4px rgba(0,0,0,0.8); display: flex; flex-direction: column; justify-content: center;">
             <h2>Anomalía</h2>
-            <h1>{f"Anómala ({selected_song['porcentaje_anomalia']*100:.3f}%)" if selected_song["anomaly"] == -1 else "No anómala"}</h1>
+           <h1>{"Anómala" if selected_song["anomaly"] == -1 else "No anómala"}</h1>
         </div>
     </div>
     """
